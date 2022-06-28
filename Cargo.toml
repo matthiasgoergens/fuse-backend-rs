@@ -32,7 +32,6 @@ vm-memory = { version = "0.7", features = ["backend-mmap"] }
 virtio-queue = { version = "0.1", optional = true }
 vhost = { version = "0.3", features = ["vhost-user-slave"], optional = true }
 mio = { version = "0.8", features = ["os-poll", "os-ext"]}
-passfd = { git = "https://github.com/fzgregor/passfd.git" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = { version = ">=0.8", optional = true }
