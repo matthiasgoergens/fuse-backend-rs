@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.2]
+
+### Added
+
+- [#77](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/77): Implement Sync for FileVolatileSlice
+
 ## [0.9.1]
 
 ### Fixed
