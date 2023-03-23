@@ -368,7 +368,9 @@ fn fuse_kern_mount(
         }
     }
 
-    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 1]).unwrap() {
+    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 1]).map_err(|e| SessionFailure(format!(
+        "Unexpected error from recv_with_fd: {e:?}"
+    )))? {
         (_recv_bytes, Some(file)) => Ok(file),
         (recv_bytes, None) => Err(SessionFailure(format!(
             "fusermount3 did not send a file descriptor: {recv_bytes}"
