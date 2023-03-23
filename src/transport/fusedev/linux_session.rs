@@ -9,16 +9,15 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use mio::{Events, Poll, Token, Waker};
-use nix::sys::socket::SockFlag;
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::prelude::FromRawFd;
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::fcntl::{fcntl, FcntlArg, OFlag, FdFlag};
 use nix::mount::MsFlags;
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
@@ -348,19 +347,13 @@ fn fuse_kern_mount(
     //     );
     // }
 
-    let (send, recv) = nix::sys::socket::socketpair(
-        nix::sys::socket::AddressFamily::Unix,
-        nix::sys::socket::SockType::Datagram,
-        None,
-        SockFlag::SOCK_NONBLOCK,
-    )
-    .unwrap();
-
-    eprintln!("mountpoint: {:?}", mountpoint);
+    let (send, recv) = UnixDatagram::pair().unwrap();
+    // Clear CLOEXEC flag set in UnixDatagram::unbound()
+    nix::fcntl::fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
 
     assert_eq!(
         std::process::Command::new("fusermount3")
-            .env("_FUSE_COMMFD", format!("{}", send))
+            .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
             .arg("-o")
             .arg(opts)
             .arg(mountpoint)
@@ -370,10 +363,10 @@ fn fuse_kern_mount(
         Some(0)
     );
 
-    let fuse_fd = passfd::FdPassingExt::recv_fd(&recv).unwrap();
-    eprintln!("got fuse fd {}", fuse_fd);
-    let file = unsafe { std::fs::File::from_raw_fd(fuse_fd) };
-    eprintln!("fuse fd metadata: {:?}", file.metadata());
+    let mut dummy = [0u8; 8];
+    let (_recv_bytes, fuse_fd) =
+        vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut dummy).unwrap();
+    let file = fuse_fd.unwrap();
 
     Ok(file)
 }
