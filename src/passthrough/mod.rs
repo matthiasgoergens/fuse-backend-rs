@@ -1245,7 +1245,7 @@ mod tests {
             no_open: cfg,
             ..Default::default()
         };
-        let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
         fs.import().unwrap();
         vfs.mount(Box::new(fs), "/submnt/A").unwrap();
 

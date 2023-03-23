@@ -53,7 +53,7 @@ mod fusedev_tests {
             return false;
         }
 
-        return true;
+        true
     }
 
     fn exec(cmd: &str) -> Result<String> {
@@ -64,13 +64,13 @@ mod fusedev_tests {
             .env("RUST_BACKTRACE", "1")
             .output()?;
 
-        if !output.status.success() || output.stderr.len() > 0 {
+        if !output.status.success() || !output.stderr.is_empty() {
             let msg = std::str::from_utf8(&output.stderr).unwrap();
             panic!("exec failed: {}: {}", cmd, msg);
         }
         let stdout = std::str::from_utf8(&output.stdout).unwrap();
 
-        return Ok(stdout.to_string());
+        Ok(stdout.to_string())
     }
 
     #[test]

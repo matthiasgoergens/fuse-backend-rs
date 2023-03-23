@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(reader.available_bytes(), 106);
         assert_eq!(reader.bytes_read(), 0);
 
-        let mut buffer = [0 as u8; 64];
+        let mut buffer = [0_u8; 64];
         if let Err(_) = reader.read_exact(&mut buffer) {
             panic!("read_exact should not fail here");
         }
@@ -554,7 +554,7 @@ mod tests {
         assert_eq!(writer.available_bytes(), 106);
         assert_eq!(writer.bytes_written(), 0);
 
-        let mut buffer = [0 as u8; 64];
+        let mut buffer = [0_u8; 64];
         if let Err(_) = writer.write_all(&mut buffer) {
             panic!("write_all should not fail here");
         }
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(writer.available_bytes(), 42);
         assert_eq!(writer.bytes_written(), 64);
 
-        let mut buffer = [0 as u8; 42];
+        let mut buffer = [0_u8; 42];
         match writer.write(&mut buffer) {
             Err(_) => panic!("write should not fail here"),
             Ok(length) => assert_eq!(length, 42),
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(writer2.available_bytes(), 2);
         assert_eq!(writer2.bytes_written(), 0);
 
-        let mut buffer = [0 as u8; 64];
+        let mut buffer = [0_u8; 64];
         if let Err(_) = writer.write_all(&mut buffer) {
             panic!("write_all should not fail here");
         }
@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(writer.available_bytes(), 42);
         assert_eq!(writer.bytes_written(), 64);
 
-        let mut buffer = [0 as u8; 42];
+        let mut buffer = [0_u8; 42];
         match writer.write(&mut buffer) {
             Err(_) => panic!("write should not fail here"),
             Ok(length) => assert_eq!(length, 42),
