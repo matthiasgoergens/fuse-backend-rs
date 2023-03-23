@@ -337,8 +337,14 @@ fn fuse_kern_mount(
 
     let (send, recv) = UnixDatagram::pair().unwrap();
     // Clear CLOEXEC flag set in UnixDatagram::unbound()
+    // to intentionally 'leak' the socket to the child process.
+    // NOTE: strictly speaking, we are unsetting all flags, not just CLOEXEC.
+    // But this is fine, because we don't need any other flags.
     nix::fcntl::fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+    println!("send: {}\trecv: {}", send.as_raw_fd(), recv.as_raw_fd());
+    eprintln!("mountpoint: {:?}", mountpoint);
 
+    // TODO(Matthias): pass on failure, instead of asserting.
     assert_eq!(
         std::process::Command::new("fusermount3")
             .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
@@ -351,9 +357,9 @@ fn fuse_kern_mount(
         Some(0)
     );
 
-    let mut dummy = [0u8; 8];
-    let (_recv_bytes, fuse_fd) =
-        vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut dummy).unwrap();
+    let (recv_bytes, fuse_fd) =
+        vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 1]).unwrap();
+    println!("recv_bytes: {recv_bytes}");
     let file = fuse_fd.unwrap();
 
     Ok(file)
