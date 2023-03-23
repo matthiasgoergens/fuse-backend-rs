@@ -23,7 +23,11 @@ use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{getgid, getuid, read};
 
-use super::{super::pagesize, Error::{SessionFailure, IoError}, FuseBuf, FuseDevWriter, Reader, Result};
+use super::{
+    super::pagesize,
+    Error::{IoError, SessionFailure},
+    FuseBuf, FuseDevWriter, Reader, Result,
+};
 
 // These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;
@@ -339,28 +343,37 @@ fn fuse_kern_mount(
     // Intentionally 'leak' the sending socket to 'fusermount3'.
     let send = filedesc::FileDesc::new(std::os::fd::OwnedFd::from(send));
     send.set_close_on_exec(false).unwrap();
-    println!("recv: {}\tsend_keep_open: {}, send: {:?}", recv.as_raw_fd(), send.as_raw_fd(), send);
+    println!(
+        "recv: {}\tsend_keep_open: {}, send: {:?}",
+        recv.as_raw_fd(),
+        send.as_raw_fd(),
+        send
+    );
     eprintln!("mountpoint: {:?}", mountpoint);
 
-    match
-        std::process::Command::new("fusermount3")
-            .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
-            .arg("-o")
-            .arg(opts)
-            .arg(mountpoint)
-            .status()
-            .map_err(|e| IoError(e))?.code() {
-        Some(0) => {},
-        exit_code =>
-            return Err(SessionFailure(format!("Unexpected exit code when running fusermount3: {exit_code:?}")))
+    match std::process::Command::new("fusermount3")
+        .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
+        .arg("-o")
+        .arg(opts)
+        .arg(mountpoint)
+        .status()
+        .map_err(|e| IoError(e))?
+        .code()
+    {
+        Some(0) => {}
+        exit_code => {
+            return Err(SessionFailure(format!(
+                "Unexpected exit code when running fusermount3: {exit_code:?}"
+            )))
+        }
     }
 
-    let (recv_bytes, fuse_fd) =
-        vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 1]).unwrap();
-    println!("recv_bytes: {recv_bytes}");
-    let file = fuse_fd.unwrap();
-
-    Ok(file)
+    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 1]).unwrap() {
+        (_recv_bytes, Some(file)) => Ok(file),
+        (recv_bytes, None) => Err(SessionFailure(format!(
+            "fusermount3 did not send a file descriptor: {recv_bytes}"
+        ))),
+    }
 }
 
 /// Umount a fuse file system
