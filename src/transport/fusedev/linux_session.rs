@@ -30,7 +30,6 @@ const FUSE_KERN_BUF_SIZE: usize = 256;
 const FUSE_HEADER_SIZE: usize = 0x1000;
 const POLL_EVENTS_CAPACITY: usize = 1024;
 
-// const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_FSTYPE: &str = "fuse";
 
 const EXIT_FUSE_EVENT: Token = Token(0);
@@ -335,17 +334,6 @@ fn fuse_kern_mount(
         fstype.push('.');
         fstype.push_str(subtype);
     }
-
-    // if let Some(mountpoint) = mountpoint.to_str() {
-    //     info!(
-    //         "mount source {} dest {} with fstype {} opts {} fd {}",
-    //         fsname,
-    //         mountpoint,
-    //         fstype,
-    //         opts,
-    //         file.as_raw_fd(),
-    //     );
-    // }
 
     let (send, recv) = UnixDatagram::pair().unwrap();
     // Clear CLOEXEC flag set in UnixDatagram::unbound()
