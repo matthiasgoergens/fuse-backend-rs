@@ -378,7 +378,7 @@ fn fuse_kern_mount(
     )? {
         (_recv_bytes, Some(file)) => Ok(file),
         (recv_bytes, None) => Err(SessionFailure(format!(
-            "fusermount3 did not send a file descriptor: {recv_bytes}"
+            "fusermount3 did not send a file descriptor.  We received {recv_bytes} bytes."
         ))),
     }
 }
