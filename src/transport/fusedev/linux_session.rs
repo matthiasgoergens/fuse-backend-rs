@@ -9,16 +9,17 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use mio::{Events, Poll, Token, Waker};
-use std::fs::{File, OpenOptions};
-use std::ops::Deref;
+use nix::sys::socket::SockFlag;
+use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::prelude::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::mount::MsFlags;
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{getgid, getuid, read};
@@ -30,7 +31,7 @@ const FUSE_KERN_BUF_SIZE: usize = 256;
 const FUSE_HEADER_SIZE: usize = 0x1000;
 const POLL_EVENTS_CAPACITY: usize = 1024;
 
-const FUSE_DEVICE: &str = "/dev/fuse";
+// const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_FSTYPE: &str = "fuse";
 
 const EXIT_FUSE_EVENT: Token = Token(0);
@@ -310,22 +311,25 @@ impl FuseChannel {
 }
 
 /// Mount a fuse file system
-fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlags) -> Result<File> {
-    let file = OpenOptions::new()
-        .create(false)
-        .read(true)
-        .write(true)
-        .open(FUSE_DEVICE)
-        .map_err(|e| SessionFailure(format!("open {FUSE_DEVICE}: {e}")))?;
+fn fuse_kern_mount(
+    mountpoint: &Path,
+    _fsname: &str,
+    subtype: &str,
+    flags: MsFlags,
+) -> Result<File> {
     let meta = mountpoint
         .metadata()
         .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
     let opts = format!(
-        "default_permissions,allow_other,fd={},rootmode={:o},user_id={},group_id={}",
-        file.as_raw_fd(),
+        "rootmode={:o},user_id={},group_id={}{}",
         meta.permissions().mode() & libc::S_IFMT,
         getuid(),
         getgid(),
+        if flags.contains(MsFlags::MS_RDONLY) {
+            ",ro"
+        } else {
+            ""
+        }
     );
     let mut fstype = String::from(FUSE_FSTYPE);
     if !subtype.is_empty() {
@@ -333,24 +337,43 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
         fstype.push_str(subtype);
     }
 
-    if let Some(mountpoint) = mountpoint.to_str() {
-        info!(
-            "mount source {} dest {} with fstype {} opts {} fd {}",
-            fsname,
-            mountpoint,
-            fstype,
-            opts,
-            file.as_raw_fd(),
-        );
-    }
-    mount(
-        Some(fsname),
-        mountpoint,
-        Some(fstype.deref()),
-        flags,
-        Some(opts.deref()),
+    // if let Some(mountpoint) = mountpoint.to_str() {
+    //     info!(
+    //         "mount source {} dest {} with fstype {} opts {} fd {}",
+    //         fsname,
+    //         mountpoint,
+    //         fstype,
+    //         opts,
+    //         file.as_raw_fd(),
+    //     );
+    // }
+
+    let (send, recv) = nix::sys::socket::socketpair(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::Datagram,
+        None,
+        SockFlag::SOCK_NONBLOCK,
     )
-    .map_err(|e| SessionFailure(format!("failed to mount {mountpoint:?}: {e}")))?;
+    .unwrap();
+
+    eprintln!("mountpoint: {:?}", mountpoint);
+
+    assert_eq!(
+        std::process::Command::new("fusermount3")
+            .env("_FUSE_COMMFD", format!("{}", send))
+            .arg("-o")
+            .arg(opts)
+            .arg(mountpoint)
+            .status()
+            .unwrap()
+            .code(),
+        Some(0)
+    );
+
+    let fuse_fd = passfd::FdPassingExt::recv_fd(&recv).unwrap();
+    eprintln!("got fuse fd {}", fuse_fd);
+    let file = unsafe { std::fs::File::from_raw_fd(fuse_fd) };
+    eprintln!("fuse fd metadata: {:?}", file.metadata());
 
     Ok(file)
 }
@@ -372,8 +395,17 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
     // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
     // cause deadlock.
     drop(file);
-    umount2(mountpoint, MntFlags::MNT_DETACH)
-        .map_err(|e| SessionFailure(format!("failed to umount {mountpoint}: {e}")))
+    assert_eq!(
+        std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(mountpoint)
+            .status()
+            .unwrap()
+            .code(),
+        Some(0)
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
