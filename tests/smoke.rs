@@ -21,9 +21,9 @@ mod fusedev_tests {
 
     fn validate_two_git_directory(src: &str, dest: &str) -> bool {
         let src_files =
-            exec(format!("cd {}; git ls-files;cd - > /dev/null", src).as_str()).unwrap();
+            exec(format!("cd {src}; git ls-files;cd - > /dev/null").as_str()).unwrap();
         let dest_files =
-            exec(format!("cd {}; git ls-files;cd - > /dev/null", dest).as_str()).unwrap();
+            exec(format!("cd {dest}; git ls-files;cd - > /dev/null").as_str()).unwrap();
         if src_files != dest_files {
             error!(
                 "src {}:\n{}\ndest {}:\n{}",
@@ -34,16 +34,14 @@ mod fusedev_tests {
 
         let src_md5 = exec(
             format!(
-                "cd {}; git ls-files --recurse-submodules | grep -v rust-vmm-ci | xargs md5sum; cd - > /dev/null",
-                src
+                "cd {src}; git ls-files --recurse-submodules | grep -v rust-vmm-ci | xargs md5sum; cd - > /dev/null"
             )
             .as_str(),
         )
         .unwrap();
         let dest_md5 = exec(
             format!(
-                "cd {}; git ls-files --recurse-submodules | grep -v rust-vmm-ci | xargs md5sum; cd - > /dev/null",
-                dest
+                "cd {dest}; git ls-files --recurse-submodules | grep -v rust-vmm-ci | xargs md5sum; cd - > /dev/null"
             )
             .as_str(),
         )
