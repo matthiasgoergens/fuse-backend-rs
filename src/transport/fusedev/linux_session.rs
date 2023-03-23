@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, OFlag, FdFlag};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::MsFlags;
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
@@ -336,12 +336,10 @@ fn fuse_kern_mount(
     }
 
     let (send, recv) = UnixDatagram::pair().unwrap();
-    // Clear CLOEXEC flag set in UnixDatagram::unbound()
-    // to intentionally 'leak' the socket to the child process.
-    // NOTE: strictly speaking, we are unsetting all flags, not just CLOEXEC.
-    // But this is fine, because we don't need any other flags.
-    nix::fcntl::fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
-    println!("send: {}\trecv: {}", send.as_raw_fd(), recv.as_raw_fd());
+    // Intentionally 'leak' the sending socket to 'fusermount3'.
+    let send = filedesc::FileDesc::new(std::os::fd::OwnedFd::from(send));
+    send.set_close_on_exec(false).unwrap();
+    println!("recv: {}\tsend_keep_open: {}, send: {:?}", recv.as_raw_fd(), send.as_raw_fd(), send);
     eprintln!("mountpoint: {:?}", mountpoint);
 
     // TODO(Matthias): pass on failure, instead of asserting.
