@@ -61,7 +61,7 @@ const MOUNTER: Mounter = Mounter {
 };
 
 const FUSERMOUNTER: Mounter = Mounter {
-    mount: fuse_kern_mount_,
+    mount: fuse_fusermount3_mount,
     unmount: fuse_kern_umount_fusermount3,
 };
 
@@ -151,7 +151,7 @@ impl FuseSession {
     }
 
     /// Destroy a fuse session.
-    /// TODO(Matthias): this also needs to distinguish between fusermount and 
+    /// TODO(Matthias): this also needs to distinguish between fusermount and
     /// fuse_kern_mount.
     pub fn umount(&mut self) -> Result<()> {
         if let Some(file) = self.file.take() {
@@ -420,7 +420,7 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
 }
 
 /// Mount a fuse file system
-fn fuse_kern_mount_(
+fn fuse_fusermount3_mount(
     mountpoint: &Path,
     fsname: &str,
     subtype: &str,
@@ -488,7 +488,7 @@ On some systems, calling wait or similar is necessary for the OS to release reso
 The standard library does not automatically wait on child processes (not even if the Child is dropped), it is up to the application developer to do so. As a consequence, dropping Child handles without waiting on them first is not recommended in long-running applications.
 */
 
-// 
+//
 
     match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 8]).map_err(
         |e| {
