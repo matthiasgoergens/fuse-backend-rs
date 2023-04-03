@@ -9,7 +9,8 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use mio::{Events, Poll, Token, Waker};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
@@ -18,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::mount::MsFlags;
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{getgid, getuid, read};
@@ -34,10 +35,35 @@ const FUSE_KERN_BUF_SIZE: usize = 256;
 const FUSE_HEADER_SIZE: usize = 0x1000;
 const POLL_EVENTS_CAPACITY: usize = 1024;
 
+const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_FSTYPE: &str = "fuse";
 
 const EXIT_FUSE_EVENT: Token = Token(0);
 const FUSE_DEV_EVENT: Token = Token(1);
+
+type KernMount = fn(
+    mountpoint: &Path,
+    fsname: &str,
+    subtype: &str,
+    flags: MsFlags,
+) -> Result<File>;
+
+type KernUnmount = fn (mountpoint: &str, file: File) -> Result<()>;
+
+struct Mounter {
+    mount: KernMount,
+    unmount: KernUnmount,
+}
+
+const MOUNTER: Mounter = Mounter {
+    mount: fuse_kern_mount,
+    unmount: fuse_kern_umount,
+};
+
+const FUSERMOUNTER: Mounter = Mounter {
+    mount: fuse_kern_mount_,
+    unmount: fuse_kern_umount_fusermount3,
+};
 
 /// A fuse session manager to manage the connection with the in kernel fuse driver.
 pub struct FuseSession {
@@ -48,15 +74,17 @@ pub struct FuseSession {
     bufsize: usize,
     readonly: bool,
     wakers: Mutex<Vec<Arc<Waker>>>,
+    mounter: Mounter,
 }
 
 impl FuseSession {
-    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
-    pub fn new(
+    /// Create a new fuse session, without mounting/connecting
+    fn new_with_mounter(
         mountpoint: &Path,
         fsname: &str,
         subtype: &str,
         readonly: bool,
+        mounter: Mounter,
     ) -> Result<FuseSession> {
         let dest = mountpoint
             .canonicalize()
@@ -73,7 +101,28 @@ impl FuseSession {
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
             readonly,
             wakers: Mutex::new(Vec::new()),
+            mounter: mounter,
         })
+    }
+
+    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
+    pub fn new(
+        mountpoint: &Path,
+        fsname: &str,
+        subtype: &str,
+        readonly: bool,
+    ) -> Result<FuseSession> {
+        FuseSession::new_with_mounter(mountpoint, fsname, subtype, readonly, MOUNTER)
+    }
+
+    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
+    pub fn new_with_fusermount(
+        mountpoint: &Path,
+        fsname: &str,
+        subtype: &str,
+        readonly: bool,
+    ) -> Result<FuseSession> {
+        FuseSession::new_with_mounter(mountpoint, fsname, subtype, readonly, FUSERMOUNTER)
     }
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
@@ -82,7 +131,7 @@ impl FuseSession {
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }
-        let file = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
+        let file = (self.mounter.mount)(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
@@ -92,7 +141,7 @@ impl FuseSession {
     }
 
     /// Expose the associated FUSE session file.
-    pub fn get_fuse_file(&mut self) -> Option<&File> {
+    pub fn get_fuse_file(&self) -> Option<&File> {
         self.file.as_ref()
     }
 
@@ -102,10 +151,12 @@ impl FuseSession {
     }
 
     /// Destroy a fuse session.
+    /// TODO(Matthias): this also needs to distinguish between fusermount and 
+    /// fuse_kern_mount.
     pub fn umount(&mut self) -> Result<()> {
         if let Some(file) = self.file.take() {
             if let Some(mountpoint) = self.mountpoint.to_str() {
-                fuse_kern_umount(mountpoint, file)
+                (self.mounter.unmount)(mountpoint, file)
             } else {
                 Err(SessionFailure("invalid mountpoint".to_string()))
             }
@@ -312,10 +363,66 @@ impl FuseChannel {
     }
 }
 
+// TODO(Matthias): we have three cases here:
+// 1 use mount system call to mount the fuse file system
+// 2 use fusermount3 to mount the fuse file system and check
+//   that it exits propely
+// 3 use fusermount3 with auto_unmount option, and let it keep running.
+// TODO(Matthias): can we treat case 2 like case 3?  Ie don't check for clean
+// exit, as long as we get our fs mounted?
+// NOTE: auto_unmount and allow_other don't work together, yet.  Only on latest
+// libfuse's master is that bug fixed.  We can probably detect that, maybe?
+
 /// Mount a fuse file system
-fn fuse_kern_mount(
+fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlags) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(false)
+        .read(true)
+        .write(true)
+        .open(FUSE_DEVICE)
+        .map_err(|e| SessionFailure(format!("open {FUSE_DEVICE}: {e}")))?;
+    let meta = mountpoint
+        .metadata()
+        .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
+    let opts = format!(
+        "default_permissions,allow_other,fd={},rootmode={:o},user_id={},group_id={}",
+        file.as_raw_fd(),
+        meta.permissions().mode() & libc::S_IFMT,
+        getuid(),
+        getgid(),
+    );
+    let mut fstype = String::from(FUSE_FSTYPE);
+    if !subtype.is_empty() {
+        fstype.push('.');
+        fstype.push_str(subtype);
+    }
+
+    if let Some(mountpoint) = mountpoint.to_str() {
+        info!(
+            "mount source {} dest {} with fstype {} opts {} fd {}",
+            fsname,
+            mountpoint,
+            fstype,
+            opts,
+            file.as_raw_fd(),
+        );
+    }
+    mount(
+        Some(fsname),
+        mountpoint,
+        Some(fstype.deref()),
+        flags,
+        Some(opts.deref()),
+    )
+    .map_err(|e| SessionFailure(format!("failed to mount {mountpoint:?}: {e}")))?;
+
+    Ok(file)
+}
+
+/// Mount a fuse file system
+fn fuse_kern_mount_(
     mountpoint: &Path,
-    _fsname: &str,
+    fsname: &str,
     subtype: &str,
     flags: MsFlags,
 ) -> Result<File> {
@@ -323,10 +430,14 @@ fn fuse_kern_mount(
         .metadata()
         .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
     let opts = format!(
-        "rootmode={:o},user_id={},group_id={}{}",
+        // This list is from the example somewhere else?
+        // auto_unmount, allow_other, default_permissions, use_ino, big_writes
+        "rootmode={:o},user_id={},group_id={},fsname={}{}", //,auto_unmount,suid{}",
+        // "rootmode={:o},user_id={},group_id={},auto_unmount,suid{}",
         meta.permissions().mode() & libc::S_IFMT,
         getuid(),
         getgid(),
+        fsname,
         if flags.contains(MsFlags::MS_RDONLY) {
             ",ro"
         } else {
@@ -350,25 +461,36 @@ fn fuse_kern_mount(
         send
     );
     eprintln!("mountpoint: {:?}", mountpoint);
+    eprintln!("opts: {:?}", opts);
 
-    match std::process::Command::new("fusermount3")
+    std::process::Command::new("fusermount3")
+    // std::process::Command::new("fusermount3_no_privs")
         .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
         .arg("-o")
         .arg(opts)
         .arg(mountpoint)
-        .status()
-        .map_err(|e| IoError(e))?
-        .code()
-    {
-        Some(0) => {}
-        exit_code => {
-            return Err(SessionFailure(format!(
-                "Unexpected exit code when running fusermount3: {exit_code:?}"
-            )))
-        }
-    }
+        .spawn()
+        // .status()
+        .map_err(|e| IoError(e))?;
+    //     .code()
+    // {
+    //     Some(0) => {}
+    //     exit_code => {
+    //         return Err(SessionFailure(format!(
+    //             "Unexpected exit code when running fusermount3: {exit_code:?}"
+    //         )))
+    //     }
+    // }
 
-    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 1]).map_err(
+/*
+On some systems, calling wait or similar is necessary for the OS to release resources. A process that terminated but has not been waited on is still around as a “zombie”. Leaving too many zombies around may exhaust global resources (for example process IDs).
+
+The standard library does not automatically wait on child processes (not even if the Child is dropped), it is up to the application developer to do so. As a consequence, dropping Child handles without waiting on them first is not recommended in long-running applications.
+*/
+
+// 
+
+    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 8]).map_err(
         |e| {
             SessionFailure(format!(
                 "Unexpected error when receiving fuse file descriptor from fusermount3: {}",
@@ -376,7 +498,10 @@ fn fuse_kern_mount(
             ))
         },
     )? {
-        (_recv_bytes, Some(file)) => Ok(file),
+        (recv_bytes, Some(file)) => {
+            eprintln!("recv_bytes: {}", recv_bytes);
+            Ok(file)
+        },
         (recv_bytes, None) => Err(SessionFailure(format!(
             "fusermount3 did not send a file descriptor.  We received {recv_bytes} bytes."
         ))),
@@ -399,6 +524,28 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
 
     // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
     // cause deadlock.
+    drop(file);
+    umount2(mountpoint, MntFlags::MNT_DETACH)
+        .map_err(|e| SessionFailure(format!("failed to umount {mountpoint}: {e}")))
+}
+
+/// Umount a fuse file system
+fn fuse_kern_umount_fusermount3(mountpoint: &str, file: File) -> Result<()> {
+    let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
+
+    if poll(&mut fds, 0).is_ok() {
+        // POLLERR means the file system is already umounted,
+        // or the connection has been aborted via /sys/fs/fuse/connections/NNN/abort
+        if let Some(event) = fds[0].revents() {
+            if event == PollFlags::POLLERR {
+                return Ok(());
+            }
+        }
+    }
+
+    // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
+    // cause deadlock.
+    // TODO(Matthias); convert assert to proper error handling.
     drop(file);
     assert_eq!(
         std::process::Command::new("fusermount3")
