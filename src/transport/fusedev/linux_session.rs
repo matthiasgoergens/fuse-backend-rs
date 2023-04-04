@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -46,7 +46,7 @@ type KernMount = fn(
     fsname: &str,
     subtype: &str,
     flags: MsFlags,
-) -> Result<File>;
+) -> Result<(File, Option<UnixStream>)>;
 
 type KernUnmount = fn (mountpoint: &str, file: File) -> Result<()>;
 
@@ -71,6 +71,7 @@ pub struct FuseSession {
     fsname: String,
     subtype: String,
     file: Option<File>,
+    socket: Option<UnixStream>,
     bufsize: usize,
     readonly: bool,
     wakers: Mutex<Vec<Arc<Waker>>>,
@@ -98,6 +99,7 @@ impl FuseSession {
             fsname: fsname.to_owned(),
             subtype: subtype.to_owned(),
             file: None,
+            socket: None,
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
             readonly,
             wakers: Mutex::new(Vec::new()),
@@ -131,11 +133,18 @@ impl FuseSession {
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }
-        let file = (self.mounter.mount)(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
+        let (file, socket) = (self.mounter.mount)(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
         self.file = Some(file);
+        self.socket = socket;
+
+        std::process::Command::new("ls")
+        .arg("--color=yes")
+        .arg("-l")
+        .arg(format!("/proc/{}/fd", std::process::id()))
+        .spawn().unwrap();
 
         Ok(())
     }
@@ -154,7 +163,7 @@ impl FuseSession {
     /// TODO(Matthias): this also needs to distinguish between fusermount and
     /// fuse_kern_mount.
     pub fn umount(&mut self) -> Result<()> {
-        if let Some(file) = self.file.take() {
+        let result = if let Some(file) = self.file.take() {
             if let Some(mountpoint) = self.mountpoint.to_str() {
                 (self.mounter.unmount)(mountpoint, file)
             } else {
@@ -162,7 +171,9 @@ impl FuseSession {
             }
         } else {
             Ok(())
-        }
+        };
+        drop(self.socket.take());
+        return result;
     }
 
     /// Get the mountpoint of the session.
@@ -374,7 +385,7 @@ impl FuseChannel {
 // libfuse's master is that bug fixed.  We can probably detect that, maybe?
 
 /// Mount a fuse file system
-fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlags) -> Result<File> {
+fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlags) -> Result<(File, Option<UnixStream>)> {
     let file = OpenOptions::new()
         .create(false)
         .read(true)
@@ -416,7 +427,7 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
     )
     .map_err(|e| SessionFailure(format!("failed to mount {mountpoint:?}: {e}")))?;
 
-    Ok(file)
+    Ok((file, None))
 }
 
 /// Mount a fuse file system
@@ -425,14 +436,14 @@ fn fuse_fusermount3_mount(
     fsname: &str,
     subtype: &str,
     flags: MsFlags,
-) -> Result<File> {
+) -> Result<(File, Option<UnixStream>)> {
     let meta = mountpoint
         .metadata()
         .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
     let opts = format!(
         // This list is from the example somewhere else?
         // auto_unmount, allow_other, default_permissions, use_ino, big_writes
-        "rootmode={:o},user_id={},group_id={},fsname={}{}", //,auto_unmount,suid{}",
+        "rootmode={:o},user_id={},group_id={},fsname={},auto_unmount{}", //,auto_unmount,suid{}",
         // "rootmode={:o},user_id={},group_id={},auto_unmount,suid{}",
         meta.permissions().mode() & libc::S_IFMT,
         getuid(),
@@ -450,12 +461,23 @@ fn fuse_fusermount3_mount(
         fstype.push_str(subtype);
     }
 
-    let (send, recv) = UnixDatagram::pair().unwrap();
+
+    let (send, recv) = UnixStream::pair().unwrap();
+
+    // let (send, recv) = UnixDatagram::pair().unwrap();
+
+    println!("My pid is {}", std::process::id());
+    std::process::Command::new("ls")
+        .arg("-l")
+        .arg("--color=yes")
+        .arg(format!("/proc/{}/fd", std::process::id()))
+        .spawn().unwrap().wait().unwrap();
+    // send = fds[0]; recv = fds[1]
     // Intentionally 'leak' the sending socket to 'fusermount3'.
     let send = filedesc::FileDesc::new(std::os::fd::OwnedFd::from(send));
-    send.set_close_on_exec(false).unwrap();
+    send.set_close_on_exec(false).map_err(|e| IoError(e))?;
     println!(
-        "recv: {}\tsend_keep_open: {}, send: {:?}",
+        "recv: {}\tsend_keep_open in child: {}, send: {:?}",
         recv.as_raw_fd(),
         send.as_raw_fd(),
         send
@@ -463,11 +485,12 @@ fn fuse_fusermount3_mount(
     eprintln!("mountpoint: {:?}", mountpoint);
     eprintln!("opts: {:?}", opts);
 
-    std::process::Command::new("fusermount3")
+    std::process::Command::new("/usr/local/bin/fusermount3")
     // std::process::Command::new("fusermount3_no_privs")
         .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
         .arg("-o")
         .arg(opts)
+        .arg("--")
         .arg(mountpoint)
         .spawn()
         // .status()
@@ -481,8 +504,11 @@ fn fuse_fusermount3_mount(
     //         )))
     //     }
     // }
+    // send.
+    // send.close();
+    drop(send);
 
-    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 8]).map_err(
+    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 0]).map_err(
         |e| {
             SessionFailure(format!(
                 "Unexpected error when receiving fuse file descriptor from fusermount3: {}",
@@ -492,7 +518,11 @@ fn fuse_fusermount3_mount(
     )? {
         (recv_bytes, Some(file)) => {
             eprintln!("recv_bytes: {}", recv_bytes);
-            Ok(file)
+            // use std::os::fd::IntoRawFd;
+            // spawn a co-routine or thread that holds on to the fd?
+            // std::thread::spawn();
+            // recv.into_raw_fd();
+            Ok((file, Some(recv)))
         },
         (recv_bytes, None) => Err(SessionFailure(format!(
             "fusermount3 did not send a file descriptor.  We received {recv_bytes} bytes."
@@ -522,7 +552,10 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
 }
 
 /// Umount a fuse file system
-fn fuse_fusermount3_umount(mountpoint: &str, file: File) -> Result<()> {
+fn fuse_fusermount3_umount(_mountpoint: &str, _file: File) -> Result<()> {
+    /* for testing auto_unmount */
+    return Ok(());
+    /*
     let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
 
     if poll(&mut fds, 0).is_ok() {
@@ -550,6 +583,7 @@ fn fuse_fusermount3_umount(mountpoint: &str, file: File) -> Result<()> {
     );
 
     Ok(())
+    */
 }
 
 #[cfg(test)]
