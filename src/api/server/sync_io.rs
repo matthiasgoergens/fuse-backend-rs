@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use vm_memory::ByteValued;
 
+use num_traits::FromPrimitive;
+
 use super::{
     MetricsHook, Server, ServerUtil, ServerVersion, SrvContext, ZcReader, ZcWriter,
     BUFFER_HEADER_SIZE, DIRENT_PADDING, MAX_BUFFER_SIZE, MAX_REQ_PAGES, MIN_READ_BUFFER,
@@ -44,72 +46,73 @@ impl<F: FileSystem + Sync> Server<F> {
 
         trace!(
             "fuse: new req {:?}: {:?}",
-            Opcode::from(in_header.opcode),
+            Opcode::from_u32(in_header.opcode),
             in_header
         );
 
         hook.map_or((), |h| h.collect(&in_header));
 
-        let res = match in_header.opcode {
-            x if x == Opcode::Lookup as u32 => self.lookup(ctx),
-            x if x == Opcode::Forget as u32 => self.forget(ctx), // No reply.
-            x if x == Opcode::Getattr as u32 => self.getattr(ctx),
-            x if x == Opcode::Setattr as u32 => self.setattr(ctx),
-            x if x == Opcode::Readlink as u32 => self.readlink(ctx),
-            x if x == Opcode::Symlink as u32 => self.symlink(ctx),
-            x if x == Opcode::Mknod as u32 => self.mknod(ctx),
-            x if x == Opcode::Mkdir as u32 => self.mkdir(ctx),
-            x if x == Opcode::Unlink as u32 => self.unlink(ctx),
-            x if x == Opcode::Rmdir as u32 => self.rmdir(ctx),
-            x if x == Opcode::Rename as u32 => self.rename(ctx),
-            x if x == Opcode::Link as u32 => self.link(ctx),
-            x if x == Opcode::Open as u32 => self.open(ctx),
-            x if x == Opcode::Read as u32 => self.read(ctx),
-            x if x == Opcode::Write as u32 => self.write(ctx),
-            x if x == Opcode::Statfs as u32 => self.statfs(ctx),
-            x if x == Opcode::Release as u32 => self.release(ctx),
-            x if x == Opcode::Fsync as u32 => self.fsync(ctx),
-            x if x == Opcode::Setxattr as u32 => self.setxattr(ctx),
-            x if x == Opcode::Getxattr as u32 => self.getxattr(ctx),
-            x if x == Opcode::Listxattr as u32 => self.listxattr(ctx),
-            x if x == Opcode::Removexattr as u32 => self.removexattr(ctx),
-            x if x == Opcode::Flush as u32 => self.flush(ctx),
-            x if x == Opcode::Init as u32 => self.init(ctx),
-            x if x == Opcode::Opendir as u32 => self.opendir(ctx),
-            x if x == Opcode::Readdir as u32 => self.readdir(ctx),
-            x if x == Opcode::Releasedir as u32 => self.releasedir(ctx),
-            x if x == Opcode::Fsyncdir as u32 => self.fsyncdir(ctx),
-            x if x == Opcode::Getlk as u32 => self.getlk(ctx),
-            x if x == Opcode::Setlk as u32 => self.setlk(ctx),
-            x if x == Opcode::Setlkw as u32 => self.setlkw(ctx),
-            x if x == Opcode::Access as u32 => self.access(ctx),
-            x if x == Opcode::Create as u32 => self.create(ctx),
-            x if x == Opcode::Bmap as u32 => self.bmap(ctx),
-            x if x == Opcode::Ioctl as u32 => self.ioctl(ctx),
-            x if x == Opcode::Poll as u32 => self.poll(ctx),
-            x if x == Opcode::NotifyReply as u32 => self.notify_reply(ctx),
-            x if x == Opcode::BatchForget as u32 => self.batch_forget(ctx),
-            x if x == Opcode::Fallocate as u32 => self.fallocate(ctx),
-            x if x == Opcode::Readdirplus as u32 => self.readdirplus(ctx),
-            x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
-            x if x == Opcode::Lseek as u32 => self.lseek(ctx),
-            #[cfg(feature = "virtiofs")]
-            x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
-            #[cfg(feature = "virtiofs")]
-            x if x == Opcode::RemoveMapping as u32 => self.removemapping(ctx, vu_req),
-            // Group reqeusts don't need reply together
-            x => match x {
-                x if x == Opcode::Interrupt as u32 => {
+        let res = match Opcode::from_u32(in_header.opcode) {
+            None => ctx.reply_error(io::Error::from_raw_os_error(libc::ENOSYS)),
+            Some(op) => match op {
+                Opcode::Lookup => self.lookup(ctx),
+                Opcode::Forget => self.forget(ctx), // No reply.
+                Opcode::Getattr => self.getattr(ctx),
+                Opcode::Setattr => self.setattr(ctx),
+                Opcode::Readlink => self.readlink(ctx),
+                Opcode::Symlink => self.symlink(ctx),
+                Opcode::Mknod => self.mknod(ctx),
+                Opcode::Mkdir => self.mkdir(ctx),
+                Opcode::Unlink => self.unlink(ctx),
+                Opcode::Rmdir => self.rmdir(ctx),
+                Opcode::Rename => self.rename(ctx),
+                Opcode::Link => self.link(ctx),
+                Opcode::Open => self.open(ctx),
+                Opcode::Read => self.read(ctx),
+                Opcode::Write => self.write(ctx),
+                Opcode::Statfs => self.statfs(ctx),
+                Opcode::Release => self.release(ctx),
+                Opcode::Fsync => self.fsync(ctx),
+                Opcode::Setxattr => self.setxattr(ctx),
+                Opcode::Getxattr => self.getxattr(ctx),
+                Opcode::Listxattr => self.listxattr(ctx),
+                Opcode::Removexattr => self.removexattr(ctx),
+                Opcode::Flush => self.flush(ctx),
+                Opcode::Init => self.init(ctx),
+                Opcode::Opendir => self.opendir(ctx),
+                Opcode::Readdir => self.readdir(ctx),
+                Opcode::Releasedir => self.releasedir(ctx),
+                Opcode::Fsyncdir => self.fsyncdir(ctx),
+                Opcode::Getlk => self.getlk(ctx),
+                Opcode::Setlk => self.setlk(ctx),
+                Opcode::Setlkw => self.setlkw(ctx),
+                Opcode::Access => self.access(ctx),
+                Opcode::Create => self.create(ctx),
+                Opcode::Bmap => self.bmap(ctx),
+                Opcode::Ioctl => self.ioctl(ctx),
+                Opcode::Poll => self.poll(ctx),
+                Opcode::NotifyReply => self.notify_reply(ctx),
+                Opcode::BatchForget => self.batch_forget(ctx),
+                Opcode::Fallocate => self.fallocate(ctx),
+                Opcode::Readdirplus => self.readdirplus(ctx),
+                Opcode::Rename2 => self.rename2(ctx),
+                Opcode::Lseek => self.lseek(ctx),
+                #[cfg(feature = "virtiofs")]
+                Opcode::SetupMapping => self.setupmapping(ctx, vu_req),
+                #[cfg(feature = "virtiofs")]
+                Opcode::RemoveMapping => self.removemapping(ctx, vu_req),
+                // Group reqeusts don't need reply together
+                Opcode::Interrupt => {
                     self.interrupt(ctx);
                     Ok(0)
                 }
-                x if x == Opcode::Destroy as u32 => {
+                Opcode::Destroy => {
                     self.destroy(ctx);
                     Ok(0)
                 }
-                _ => ctx.reply_error(io::Error::from_raw_os_error(libc::ENOSYS)),
-            },
-        };
+                Opcode::CopyFileRange | Opcode::SetupMapping | Opcode::RemoveMapping | Opcode::MaxOpcode | Opcode::CuseInitBswapReserved | Opcode::InitBswapReserved =>
+                    ctx.reply_error(io::Error::from_raw_os_error(libc::ENOSYS)),
+        }};
 
         // Pass `None` because current API handler's design does not allow us to catch
         // the `out_header`. Hopefully, we can reach to `out_header` after some

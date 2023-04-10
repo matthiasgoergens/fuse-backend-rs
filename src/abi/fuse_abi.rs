@@ -12,6 +12,8 @@ use std::mem;
 use bitflags::bitflags;
 use vm_memory::ByteValued;
 
+use num_derive::{FromPrimitive, ToPrimitive};
+
 #[cfg(target_os = "linux")]
 pub use libc::{
     blksize_t, dev_t, ino64_t, mode_t, nlink_t, off64_t, pread64, preadv64, pwrite64, pwritev64,
@@ -709,7 +711,7 @@ pub struct FileLock {
 unsafe impl ByteValued for FileLock {}
 
 #[repr(u32)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, FromPrimitive, ToPrimitive, PartialEq, Eq)]
 pub enum Opcode {
     Lookup = 1,
     Forget = 2, /* No Reply */
@@ -717,6 +719,7 @@ pub enum Opcode {
     Setattr = 4,
     Readlink = 5,
     Symlink = 6,
+    // FUSE_GETDIR = 7 is no longer in modern kernels.
     Mknod = 8,
     Mkdir = 9,
     Unlink = 10,
@@ -728,6 +731,7 @@ pub enum Opcode {
     Write = 16,
     Statfs = 17,
     Release = 18,
+    // 19
     Fsync = 20,
     Setxattr = 21,
     Getxattr = 22,
@@ -759,19 +763,15 @@ pub enum Opcode {
     SetupMapping = 48,
     RemoveMapping = 49,
     MaxOpcode = 50,
+    // 50: FUSE_SYNCFS
+    // 51: FUSE_TMPFILE
+
+	// /* CUSE specific operations */
+	// CUSE_INIT		= 4096,
 
     /* Reserved opcodes: helpful to detect structure endian-ness in case of e.g. virtiofs */
     CuseInitBswapReserved = 1_048_576, /* CUSE_INIT << 8 */
     InitBswapReserved = 436_207_616,   /* FUSE_INIT << 24 */
-}
-
-impl From<u32> for Opcode {
-    fn from(op: u32) -> Opcode {
-        if op >= Opcode::MaxOpcode as u32 {
-            return Opcode::MaxOpcode;
-        }
-        unsafe { mem::transmute(op) }
-    }
 }
 
 #[repr(u32)]
