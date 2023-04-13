@@ -75,7 +75,6 @@ pub struct FuseSession {
     bufsize: usize,
     readonly: bool,
     wakers: Mutex<Vec<Arc<Waker>>>,
-    mounter: Mounter,
 }
 
 impl FuseSession {
@@ -85,7 +84,6 @@ impl FuseSession {
         fsname: &str,
         subtype: &str,
         readonly: bool,
-        mounter: Mounter,
     ) -> Result<FuseSession> {
         let dest = mountpoint
             .canonicalize()
@@ -107,33 +105,13 @@ impl FuseSession {
         })
     }
 
-    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
-    pub fn new(
-        mountpoint: &Path,
-        fsname: &str,
-        subtype: &str,
-        readonly: bool,
-    ) -> Result<FuseSession> {
-        FuseSession::new_with_mounter(mountpoint, fsname, subtype, readonly, MOUNTER)
-    }
-
-    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
-    pub fn new_with_fusermount(
-        mountpoint: &Path,
-        fsname: &str,
-        subtype: &str,
-        readonly: bool,
-    ) -> Result<FuseSession> {
-        FuseSession::new_with_mounter(mountpoint, fsname, subtype, readonly, FUSERMOUNTER)
-    }
-
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
         let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME;
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }
-        let (file, socket) = (self.mounter.mount)(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
+        let (file, socket) = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
