@@ -140,12 +140,6 @@ impl FuseSession {
         self.file = Some(file);
         self.socket = socket;
 
-        std::process::Command::new("ls")
-        .arg("--color=yes")
-        .arg("-l")
-        .arg(format!("/proc/{}/fd", std::process::id()))
-        .spawn().unwrap();
-
         Ok(())
     }
 
