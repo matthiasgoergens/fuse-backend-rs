@@ -46,7 +46,7 @@ pub struct FuseSession {
     mountpoint: PathBuf,
     fsname: String,
     subtype: String,
-    // Consider putting option and file in the same structure to take them together?
+    // Consider putting socket and file in the same structure to take them together?
     file: Option<File>,
     socket: Option<UnixStream>,
     bufsize: usize,
