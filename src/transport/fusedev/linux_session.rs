@@ -41,51 +41,26 @@ const FUSE_FSTYPE: &str = "fuse";
 const EXIT_FUSE_EVENT: Token = Token(0);
 const FUSE_DEV_EVENT: Token = Token(1);
 
-type KernMount = fn(
-    mountpoint: &Path,
-    fsname: &str,
-    subtype: &str,
-    flags: MsFlags,
-) -> Result<(File, Option<UnixStream>)>;
-
-type KernUnmount = fn (mountpoint: &str, file: File) -> Result<()>;
-
-struct Mounter {
-    mount: KernMount,
-    unmount: KernUnmount,
-}
-
-const MOUNTER: Mounter = Mounter {
-    mount: fuse_kern_mount,
-    unmount: fuse_kern_umount,
-};
-
-const FUSERMOUNTER: Mounter = Mounter {
-    mount: fuse_fusermount3_mount,
-    unmount: fuse_fusermount3_umount,
-};
-
 /// A fuse session manager to manage the connection with the in kernel fuse driver.
 pub struct FuseSession {
     mountpoint: PathBuf,
     fsname: String,
     subtype: String,
+    // Consider putting option and file in the same structure to take them together?
     file: Option<File>,
     socket: Option<UnixStream>,
     bufsize: usize,
     readonly: bool,
     wakers: Mutex<Vec<Arc<Waker>>>,
-    mounter: Mounter,
 }
 
 impl FuseSession {
-    /// Create a new fuse session, without mounting/connecting
-    fn new_with_mounter(
+    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
+    pub fn new(
         mountpoint: &Path,
         fsname: &str,
         subtype: &str,
         readonly: bool,
-        mounter: Mounter,
     ) -> Result<FuseSession> {
         let dest = mountpoint
             .canonicalize()
@@ -103,28 +78,7 @@ impl FuseSession {
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
             readonly,
             wakers: Mutex::new(Vec::new()),
-            mounter: mounter,
         })
-    }
-
-    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
-    pub fn new(
-        mountpoint: &Path,
-        fsname: &str,
-        subtype: &str,
-        readonly: bool,
-    ) -> Result<FuseSession> {
-        FuseSession::new_with_mounter(mountpoint, fsname, subtype, readonly, MOUNTER)
-    }
-
-    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
-    pub fn new_with_fusermount(
-        mountpoint: &Path,
-        fsname: &str,
-        subtype: &str,
-        readonly: bool,
-    ) -> Result<FuseSession> {
-        FuseSession::new_with_mounter(mountpoint, fsname, subtype, readonly, FUSERMOUNTER)
     }
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
@@ -133,7 +87,12 @@ impl FuseSession {
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }
-        let (file, socket) = (self.mounter.mount)(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
+        let (file, socket) =
+            match fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags) {
+            Ok(Some(file)) => Ok((file, None)),
+            Ok(None) => fuse_fusermount_mount(&self.mountpoint, &self.fsname, &self.subtype, flags),
+            Err(e) => Err(e)
+            }?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
@@ -159,7 +118,7 @@ impl FuseSession {
     pub fn umount(&mut self) -> Result<()> {
         let result = if let Some(file) = self.file.take() {
             if let Some(mountpoint) = self.mountpoint.to_str() {
-                (self.mounter.unmount)(mountpoint, file)
+                fuse_kern_umount(mountpoint, file)
             } else {
                 Err(SessionFailure("invalid mountpoint".to_string()))
             }
@@ -379,7 +338,7 @@ impl FuseChannel {
 // libfuse's master is that bug fixed.  We can probably detect that, maybe?
 
 /// Mount a fuse file system
-fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlags) -> Result<(File, Option<UnixStream>)> {
+fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlags) -> Result<Option<File>> {
     let file = OpenOptions::new()
         .create(false)
         .read(true)
@@ -412,20 +371,21 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
             file.as_raw_fd(),
         );
     }
-    mount(
+    match mount(
         Some(fsname),
         mountpoint,
         Some(fstype.deref()),
         flags,
         Some(opts.deref()),
-    )
-    .map_err(|e| SessionFailure(format!("failed to mount {mountpoint:?}: {e}")))?;
-
-    Ok((file, None))
+    ) {
+        Err(nix::errno::Errno::EPERM) => Ok(None),
+        Err(e) => Err(SessionFailure(format!("failed to mount {mountpoint:?}: {e}"))),
+        Ok(()) => Ok(Some(file))
+    }
 }
 
 /// Mount a fuse file system
-fn fuse_fusermount3_mount(
+fn fuse_fusermount_mount(
     mountpoint: &Path,
     fsname: &str,
     subtype: &str,
