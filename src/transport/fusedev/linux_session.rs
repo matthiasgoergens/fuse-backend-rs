@@ -46,9 +46,9 @@ pub struct FuseSession {
     mountpoint: PathBuf,
     fsname: String,
     subtype: String,
-    // Consider putting socket and file in the same structure to take them together?
     file: Option<File>,
-    socket: Option<UnixStream>,
+    // Socket to keep alive / drop for fusermount's auto_unmount.
+    keep_alive: Option<UnixStream>,
     bufsize: usize,
     readonly: bool,
     wakers: Mutex<Vec<Arc<Waker>>>,
@@ -74,7 +74,7 @@ impl FuseSession {
             fsname: fsname.to_owned(),
             subtype: subtype.to_owned(),
             file: None,
-            socket: None,
+            keep_alive: None,
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
             readonly,
             wakers: Mutex::new(Vec::new()),
@@ -100,7 +100,7 @@ impl FuseSession {
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
         self.file = Some(file);
-        self.socket = socket;
+        self.keep_alive = socket;
 
         Ok(())
     }
@@ -116,11 +116,9 @@ impl FuseSession {
     }
 
     /// Destroy a fuse session.
-    /// TODO(Matthias): this also needs to distinguish between fusermount and
-    /// fuse_kern_mount.
     pub fn umount(&mut self) -> Result<()> {
-        let result = if let Some(file) = self.file.take() {
-            // consider using and_then?
+        // If we have a keep_alive sockt, just drop it, and let fusermount3 do the unmount.
+        if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
             if let Some(mountpoint) = self.mountpoint.to_str() {
                 if fuse_kern_umount(&mountpoint, file)? {
                     Ok(())
@@ -132,10 +130,7 @@ impl FuseSession {
             }
         } else {
             Ok(())
-        };
-        // TODO: check error handling?  This path is for auto_unmount
-        drop(self.socket.take());
-        return result;
+        }
     }
 
     /// Get the mountpoint of the session.
@@ -200,6 +195,7 @@ impl FuseSession {
 
 impl Drop for FuseSession {
     fn drop(&mut self) {
+        drop(self.keep_alive.take());
         let _ = self.umount();
     }
 }
