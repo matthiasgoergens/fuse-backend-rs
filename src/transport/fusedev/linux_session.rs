@@ -433,19 +433,7 @@ fn fuse_fusermount_mount(
 
     let (send, recv) = UnixStream::pair().unwrap();
 
-    // let (send, recv) = UnixDatagram::pair().unwrap();
-
-    println!("My pid is {}", std::process::id());
-    std::process::Command::new("ls")
-        .arg("-l")
-        .arg("--color=yes")
-        .arg(format!("/proc/{}/fd", std::process::id()))
-        .spawn()
-        .unwrap()
-        .wait()
-        .unwrap();
-    // send = fds[0]; recv = fds[1]
-    // Intentionally 'leak' the sending socket to 'fusermount3'.
+    // Keep the sending socket around. When it closes, fusermount3 will unmount.
     let send = filedesc::FileDesc::new(std::os::fd::OwnedFd::from(send));
     send.set_close_on_exec(false).map_err(|e| IoError(e))?;
     println!(
