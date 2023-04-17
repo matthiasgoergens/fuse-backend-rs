@@ -87,12 +87,15 @@ impl FuseSession {
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }
+        // TODO: nice error message to explain that both failed.
+        // Perhaps make trying fusermount configurable?
         let (file, socket) =
-            match fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags) {
-            Ok(Some(file)) => Ok((file, None)),
-            Ok(None) => fuse_fusermount_mount(&self.mountpoint, &self.fsname, &self.subtype, flags),
-            Err(e) => Err(e)
-            }?;
+            match fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)? {
+                Some(file) => (file, None),
+                None => {
+                    fuse_fusermount_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?
+                }
+            };
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
@@ -117,14 +120,20 @@ impl FuseSession {
     /// fuse_kern_mount.
     pub fn umount(&mut self) -> Result<()> {
         let result = if let Some(file) = self.file.take() {
+            // consider using and_then?
             if let Some(mountpoint) = self.mountpoint.to_str() {
-                fuse_kern_umount(mountpoint, file)
+                if fuse_kern_umount(&mountpoint, file)? {
+                    Ok(())
+                } else {
+                    fuse_fusermount3_umount(mountpoint)
+                }
             } else {
                 Err(SessionFailure("invalid mountpoint".to_string()))
             }
         } else {
             Ok(())
         };
+        // TODO: check error handling?  This path is for auto_unmount
         drop(self.socket.take());
         return result;
     }
@@ -338,7 +347,12 @@ impl FuseChannel {
 // libfuse's master is that bug fixed.  We can probably detect that, maybe?
 
 /// Mount a fuse file system
-fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlags) -> Result<Option<File>> {
+fn fuse_kern_mount(
+    mountpoint: &Path,
+    fsname: &str,
+    subtype: &str,
+    flags: MsFlags,
+) -> Result<Option<File>> {
     let file = OpenOptions::new()
         .create(false)
         .read(true)
@@ -379,8 +393,10 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
         Some(opts.deref()),
     ) {
         Err(nix::errno::Errno::EPERM) => Ok(None),
-        Err(e) => Err(SessionFailure(format!("failed to mount {mountpoint:?}: {e}"))),
-        Ok(()) => Ok(Some(file))
+        Err(e) => Err(SessionFailure(format!(
+            "failed to mount {mountpoint:?}: {e}"
+        ))),
+        Ok(()) => Ok(Some(file)),
     }
 }
 
@@ -415,7 +431,6 @@ fn fuse_fusermount_mount(
         fstype.push_str(subtype);
     }
 
-
     let (send, recv) = UnixStream::pair().unwrap();
 
     // let (send, recv) = UnixDatagram::pair().unwrap();
@@ -425,7 +440,10 @@ fn fuse_fusermount_mount(
         .arg("-l")
         .arg("--color=yes")
         .arg(format!("/proc/{}/fd", std::process::id()))
-        .spawn().unwrap().wait().unwrap();
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap();
     // send = fds[0]; recv = fds[1]
     // Intentionally 'leak' the sending socket to 'fusermount3'.
     let send = filedesc::FileDesc::new(std::os::fd::OwnedFd::from(send));
@@ -440,7 +458,7 @@ fn fuse_fusermount_mount(
     eprintln!("opts: {:?}", opts);
 
     std::process::Command::new("/usr/local/bin/fusermount3")
-    // std::process::Command::new("fusermount3_no_privs")
+        // std::process::Command::new("fusermount3_no_privs")
         .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
         .arg("-o")
         .arg(opts)
@@ -477,7 +495,7 @@ fn fuse_fusermount_mount(
             // std::thread::spawn();
             // recv.into_raw_fd();
             Ok((file, Some(recv)))
-        },
+        }
         (recv_bytes, None) => Err(SessionFailure(format!(
             "fusermount3 did not send a file descriptor.  We received {recv_bytes} bytes."
         ))),
@@ -485,7 +503,7 @@ fn fuse_fusermount_mount(
 }
 
 /// Umount a fuse file system
-fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
+fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<bool> {
     let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
 
     if poll(&mut fds, 0).is_ok() {
@@ -493,7 +511,7 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
         // or the connection has been aborted via /sys/fs/fuse/connections/NNN/abort
         if let Some(event) = fds[0].revents() {
             if event == PollFlags::POLLERR {
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -501,43 +519,31 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
     // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
     // cause deadlock.
     drop(file);
-    umount2(mountpoint, MntFlags::MNT_DETACH)
-        .map_err(|e| SessionFailure(format!("failed to umount {mountpoint}: {e}")))
+    match umount2(mountpoint, MntFlags::MNT_DETACH) {
+        Ok(()) => Ok(true),
+        Err(nix::errno::Errno::EPERM) => Ok(false),
+        Err(e) => Err(SessionFailure(format!(
+            "failed to umount {mountpoint}: {e}"
+        ))),
+    }
 }
 
 /// Umount a fuse file system
-fn fuse_fusermount3_umount(_mountpoint: &str, _file: File) -> Result<()> {
-    /* for testing auto_unmount */
-    return Ok(());
-    /*
-    let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
-
-    if poll(&mut fds, 0).is_ok() {
-        // POLLERR means the file system is already umounted,
-        // or the connection has been aborted via /sys/fs/fuse/connections/NNN/abort
-        if let Some(event) = fds[0].revents() {
-            if event == PollFlags::POLLERR {
-                return Ok(());
-            }
-        }
+fn fuse_fusermount3_umount(mountpoint: &str) -> Result<()> {
+    match std::process::Command::new("fusermount3")
+        .arg("--unmount")
+        .arg("--quiet")
+        .arg("--lazy")
+        .arg(mountpoint)
+        .status()
+        .map_err(|e| IoError(e))?
+        .code()
+    {
+        Some(0) => Ok(()),
+        exit_code => Err(SessionFailure(format!(
+            "Unexpected exit code when unmounting via running fusermount3: {exit_code:?}"
+        ))),
     }
-
-    // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
-    // cause deadlock.
-    // TODO(Matthias); convert assert to proper error handling.
-    drop(file);
-    assert_eq!(
-        std::process::Command::new("fusermount3")
-            .arg("-u")
-            .arg(mountpoint)
-            .status()
-            .unwrap()
-            .code(),
-        Some(0)
-    );
-
-    Ok(())
-    */
 }
 
 #[cfg(test)]
