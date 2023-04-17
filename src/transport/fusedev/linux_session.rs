@@ -89,13 +89,7 @@ impl FuseSession {
         }
         // TODO: nice error message to explain that both failed.
         // Perhaps make trying fusermount configurable?
-        let (file, socket) =
-            match fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)? {
-                Some(file) => (file, None),
-                None => {
-                    fuse_fusermount_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?
-                }
-            };
+        let (file, socket) = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
@@ -120,11 +114,7 @@ impl FuseSession {
         // If we have a keep_alive sockt, just drop it, and let fusermount3 do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
             if let Some(mountpoint) = self.mountpoint.to_str() {
-                if fuse_kern_umount(&mountpoint, file)? {
-                    Ok(())
-                } else {
-                    fuse_fusermount3_umount(mountpoint)
-                }
+                fuse_kern_umount(&mountpoint, file)
             } else {
                 Err(SessionFailure("invalid mountpoint".to_string()))
             }
@@ -348,7 +338,7 @@ fn fuse_kern_mount(
     fsname: &str,
     subtype: &str,
     flags: MsFlags,
-) -> Result<Option<File>> {
+) -> Result<(File, Option<UnixStream>)> {
     let file = OpenOptions::new()
         .create(false)
         .read(true)
@@ -388,11 +378,13 @@ fn fuse_kern_mount(
         flags,
         Some(opts.deref()),
     ) {
-        Err(nix::errno::Errno::EPERM) => Ok(None),
+        Ok(()) => Ok((file, None)),
+        Err(nix::errno::Errno::EPERM) => {
+            fuse_fusermount_mount(mountpoint, fsname, subtype, &opts, flags)
+        }
         Err(e) => Err(SessionFailure(format!(
             "failed to mount {mountpoint:?}: {e}"
         ))),
-        Ok(()) => Ok(Some(file)),
     }
 }
 
@@ -426,27 +418,13 @@ fn fuse_fusermount_mount(
     mountpoint: &Path,
     fsname: &str,
     subtype: &str,
+    opts: &str,
     flags: MsFlags,
 ) -> Result<(File, Option<UnixStream>)> {
-    let meta = mountpoint
-        .metadata()
-        .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
     let opts = format!(
-        // This list is from the example somewhere else?
-        // auto_unmount, allow_other, default_permissions, use_ino, big_writes
-        "default_permissions,allow_other,rootmode={:o},user_id={},group_id={},fsname={},auto_unmount,{}", //,auto_unmount,suid{}",
-        // "rootmode={:o},user_id={},group_id={},auto_unmount,suid{}",
-        meta.permissions().mode() & libc::S_IFMT,
-        getuid(),
-        getgid(),
-        fsname,
-        msflags_to_string(flags),
+        "{opts},fsname={fsname},subtype={subtype},{}",
+        msflags_to_string(flags)
     );
-    let mut fstype = String::from(FUSE_FSTYPE);
-    if !subtype.is_empty() {
-        fstype.push('.');
-        fstype.push_str(subtype);
-    }
 
     let (send, recv) = UnixStream::pair().unwrap();
 
@@ -502,7 +480,7 @@ fn fuse_fusermount_mount(
 }
 
 /// Umount a fuse file system
-fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<bool> {
+fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
     let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
 
     if poll(&mut fds, 0).is_ok() {
@@ -510,7 +488,7 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<bool> {
         // or the connection has been aborted via /sys/fs/fuse/connections/NNN/abort
         if let Some(event) = fds[0].revents() {
             if event == PollFlags::POLLERR {
-                return Ok(true);
+                return Ok(());
             }
         }
     }
@@ -519,8 +497,8 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<bool> {
     // cause deadlock.
     drop(file);
     match umount2(mountpoint, MntFlags::MNT_DETACH) {
-        Ok(()) => Ok(true),
-        Err(nix::errno::Errno::EPERM) => Ok(false),
+        Ok(()) => Ok(()),
+        Err(nix::errno::Errno::EPERM) => fuse_fusermount3_umount(mountpoint),
         Err(e) => Err(SessionFailure(format!(
             "failed to umount {mountpoint}: {e}"
         ))),
