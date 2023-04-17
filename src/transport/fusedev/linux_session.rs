@@ -52,6 +52,7 @@ pub struct FuseSession {
     bufsize: usize,
     readonly: bool,
     wakers: Mutex<Vec<Arc<Waker>>>,
+    auto_unmount: bool,
 }
 
 impl FuseSession {
@@ -61,6 +62,17 @@ impl FuseSession {
         fsname: &str,
         subtype: &str,
         readonly: bool,
+    ) -> Result<FuseSession> {
+        FuseSession::new_with_autounmount(mountpoint, fsname, subtype, readonly, false)
+    }
+
+    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
+    pub fn new_with_autounmount(
+        mountpoint: &Path,
+        fsname: &str,
+        subtype: &str,
+        readonly: bool,
+        auto_unmount: bool,
     ) -> Result<FuseSession> {
         let dest = mountpoint
             .canonicalize()
@@ -78,6 +90,7 @@ impl FuseSession {
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
             readonly,
             wakers: Mutex::new(Vec::new()),
+            auto_unmount,
         })
     }
 
@@ -89,7 +102,13 @@ impl FuseSession {
         }
         // TODO: nice error message to explain that both failed.
         // Perhaps make trying fusermount configurable?
-        let (file, socket) = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
+        let (file, socket) = fuse_kern_mount(
+            &self.mountpoint,
+            &self.fsname,
+            &self.subtype,
+            flags,
+            self.auto_unmount,
+        )?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
@@ -114,7 +133,7 @@ impl FuseSession {
         // If we have a keep_alive sockt, just drop it, and let fusermount3 do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
             if let Some(mountpoint) = self.mountpoint.to_str() {
-                fuse_kern_umount(&mountpoint, file)
+                fuse_kern_umount(mountpoint, file)
             } else {
                 Err(SessionFailure("invalid mountpoint".to_string()))
             }
@@ -338,6 +357,7 @@ fn fuse_kern_mount(
     fsname: &str,
     subtype: &str,
     flags: MsFlags,
+    auto_unmount: bool,
 ) -> Result<(File, Option<UnixStream>)> {
     let file = OpenOptions::new()
         .create(false)
@@ -371,21 +391,24 @@ fn fuse_kern_mount(
             file.as_raw_fd(),
         );
     }
-    match mount(
-        Some(fsname),
-        mountpoint,
-        Some(fstype.deref()),
-        flags,
-        Some(opts.deref()),
-    ) {
-        Ok(()) => Ok((file, None)),
-        Err(nix::errno::Errno::EPERM) => {
-            fuse_fusermount_mount(mountpoint, fsname, subtype, &opts, flags)
+    if !auto_unmount {
+        match mount(
+            Some(fsname),
+            mountpoint,
+            Some(fstype.deref()),
+            flags,
+            Some(opts.deref()),
+        ) {
+            Ok(()) => return Ok((file, None)),
+            Err(nix::errno::Errno::EPERM) => (),
+            Err(e) => {
+                return Err(SessionFailure(format!(
+                    "failed to mount {mountpoint:?}: {e}"
+                )))
+            }
         }
-        Err(e) => Err(SessionFailure(format!(
-            "failed to mount {mountpoint:?}: {e}"
-        ))),
     }
+    fuse_fusermount_mount(mountpoint, fsname, subtype, &opts, flags, auto_unmount)
 }
 
 fn msflags_to_string(flags: MsFlags) -> String {
@@ -420,21 +443,32 @@ fn fuse_fusermount_mount(
     subtype: &str,
     opts: &str,
     flags: MsFlags,
+    auto_unmount: bool,
 ) -> Result<(File, Option<UnixStream>)> {
-    let opts = format!(
-        "{opts},fsname={fsname},subtype={subtype},{}",
-        msflags_to_string(flags)
-    );
+    let mut opts = vec![
+        format!("fsname={fsname}"),
+        opts.to_owned(),
+        msflags_to_string(flags),
+    ];
+    if !subtype.is_empty() {
+        opts.push(format!("subtype={subtype}"));
+    }
+    if auto_unmount {
+        opts.push("auto_unmount".to_owned());
+    }
+    let opts = opts.join(",");
 
     let (send, recv) = UnixStream::pair().unwrap();
 
-    // Keep the sending socket around. When it closes, fusermount3 will unmount.
+    // Keep the sending socket around after exec to pass to fusermount3.
+    // When its partner recv closes, fusermount3 will unmount.
     let send = filedesc::FileDesc::new(std::os::fd::OwnedFd::from(send));
-    send.set_close_on_exec(false).map_err(|e| IoError(e))?;
+    send.set_close_on_exec(false).map_err(IoError)?;
 
     // consider different code paths for auto_unmount vs not?  That way we can do better error handling?
     // TODO(Matthias): consider making this configurable?  First, whether we do it at all, second, where to find fusermount3.
-    std::process::Command::new("fusermount3")
+    eprintln!("{opts}");
+    let mut proc = std::process::Command::new("fusermount3")
         .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
         // Old version of fusermount doesn't support long --options, yet.
         .arg("-o")
@@ -442,22 +476,24 @@ fn fuse_fusermount_mount(
         .arg("--")
         .arg(mountpoint)
         .spawn()
-        // .status()
-        .map_err(|e| IoError(e))?;
-    //     .code()
-    // {
-    //     Some(0) => {}
-    //     exit_code => {
-    //         return Err(SessionFailure(format!(
-    //             "Unexpected exit code when running fusermount3: {exit_code:?}"
-    //         )))
-    //     }
-    // }
-    // send.
-    // send.close();
+        .map_err(IoError)?;
+    if auto_unmount {
+        std::thread::spawn(move || {
+            proc.wait().ok();
+        });
+    } else {
+        match proc.wait().map_err(IoError)?.code() {
+            Some(0) => {}
+            exit_code => {
+                return Err(SessionFailure(format!(
+                    "Unexpected exit code when running fusermount3: {exit_code:?}"
+                )))
+            }
+        }
+    }
     drop(send);
 
-    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 0]).map_err(
+    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 8]).map_err(
         |e| {
             SessionFailure(format!(
                 "Unexpected error when receiving fuse file descriptor from fusermount3: {}",
@@ -465,14 +501,7 @@ fn fuse_fusermount_mount(
             ))
         },
     )? {
-        (recv_bytes, Some(file)) => {
-            eprintln!("recv_bytes: {}", recv_bytes);
-            // use std::os::fd::IntoRawFd;
-            // spawn a co-routine or thread that holds on to the fd?
-            // std::thread::spawn();
-            // recv.into_raw_fd();
-            Ok((file, Some(recv)))
-        }
+        (_recv_bytes, Some(file)) => Ok((file, if auto_unmount { Some(recv) } else { None })),
         (recv_bytes, None) => Err(SessionFailure(format!(
             "fusermount3 did not send a file descriptor.  We received {recv_bytes} bytes."
         ))),
@@ -514,7 +543,7 @@ fn fuse_fusermount3_umount(mountpoint: &str) -> Result<()> {
         .arg("--")
         .arg(mountpoint)
         .status()
-        .map_err(|e| IoError(e))?
+        .map_err(IoError)?
         .code()
     {
         Some(0) => Ok(()),
