@@ -396,6 +396,31 @@ fn fuse_kern_mount(
     }
 }
 
+fn msflags_to_string(flags: MsFlags) -> String {
+    [
+        (MsFlags::MS_RDONLY, ("rw", "ro")),
+        (MsFlags::MS_NOSUID, ("suid", "nosuid")),
+        (MsFlags::MS_NODEV, ("dev", "nodev")),
+        (MsFlags::MS_NOEXEC, ("exec", "noexec")),
+        (MsFlags::MS_SYNCHRONOUS, ("async", "sync")),
+        (MsFlags::MS_NOATIME, ("atime", "noatime")),
+        (MsFlags::MS_NODIRATIME, ("diratime", "nodiratime")),
+        (MsFlags::MS_LAZYTIME, ("nolazytime", "lazytime")),
+        (MsFlags::MS_RELATIME, ("norelatime", "relatime")),
+        (MsFlags::MS_STRICTATIME, ("nostrictatime", "strictatime")),
+    ]
+    .map(
+        |(flag, (neg, pos))| {
+            if flags.contains(flag) {
+                pos
+            } else {
+                neg
+            }
+        },
+    )
+    .join(",")
+}
+
 /// Mount a fuse file system
 fn fuse_fusermount_mount(
     mountpoint: &Path,
@@ -409,17 +434,13 @@ fn fuse_fusermount_mount(
     let opts = format!(
         // This list is from the example somewhere else?
         // auto_unmount, allow_other, default_permissions, use_ino, big_writes
-        "rootmode={:o},user_id={},group_id={},fsname={},auto_unmount{}", //,auto_unmount,suid{}",
+        "default_permissions,allow_other,rootmode={:o},user_id={},group_id={},fsname={},auto_unmount,{}", //,auto_unmount,suid{}",
         // "rootmode={:o},user_id={},group_id={},auto_unmount,suid{}",
         meta.permissions().mode() & libc::S_IFMT,
         getuid(),
         getgid(),
         fsname,
-        if flags.contains(MsFlags::MS_RDONLY) {
-            ",ro"
-        } else {
-            ""
-        }
+        msflags_to_string(flags),
     );
     let mut fstype = String::from(FUSE_FSTYPE);
     if !subtype.is_empty() {
@@ -434,8 +455,10 @@ fn fuse_fusermount_mount(
     send.set_close_on_exec(false).map_err(|e| IoError(e))?;
 
     // consider different code paths for auto_unmount vs not?  That way we can do better error handling?
-    std::process::Command::new("/usr/local/bin/fusermount3")
+    // TODO(Matthias): consider making this configurable?  First, whether we do it at all, second, where to find fusermount3.
+    std::process::Command::new("fusermount3")
         .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
+        // Old version of fusermount doesn't support long --options, yet.
         .arg("-o")
         .arg(opts)
         .arg("--")
