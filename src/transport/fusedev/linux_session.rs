@@ -100,8 +100,6 @@ impl FuseSession {
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }
-        // TODO: nice error message to explain that both failed.
-        // Perhaps make trying fusermount configurable?
         let (file, socket) = fuse_kern_mount(
             &self.mountpoint,
             &self.fsname,
@@ -340,16 +338,6 @@ impl FuseChannel {
         }
     }
 }
-
-// TODO(Matthias): we have three cases here:
-// 1 use mount system call to mount the fuse file system
-// 2 use fusermount3 to mount the fuse file system and check
-//   that it exits propely
-// 3 use fusermount3 with auto_unmount option, and let it keep running.
-// TODO(Matthias): can we treat case 2 like case 3?  Ie don't check for clean
-// exit, as long as we get our fs mounted?
-// NOTE: auto_unmount and allow_other don't work together, yet.  Only on latest
-// libfuse's master is that bug fixed.  We can probably detect that, maybe?
 
 /// Mount a fuse file system
 fn fuse_kern_mount(
