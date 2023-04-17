@@ -436,17 +436,9 @@ fn fuse_fusermount_mount(
     // Keep the sending socket around. When it closes, fusermount3 will unmount.
     let send = filedesc::FileDesc::new(std::os::fd::OwnedFd::from(send));
     send.set_close_on_exec(false).map_err(|e| IoError(e))?;
-    println!(
-        "recv: {}\tsend_keep_open in child: {}, send: {:?}",
-        recv.as_raw_fd(),
-        send.as_raw_fd(),
-        send
-    );
-    eprintln!("mountpoint: {:?}", mountpoint);
-    eprintln!("opts: {:?}", opts);
 
+    // consider different code paths for auto_unmount vs not?  That way we can do better error handling?
     std::process::Command::new("/usr/local/bin/fusermount3")
-        // std::process::Command::new("fusermount3_no_privs")
         .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
         .arg("-o")
         .arg(opts)
@@ -522,6 +514,7 @@ fn fuse_fusermount3_umount(mountpoint: &str) -> Result<()> {
         .arg("--unmount")
         .arg("--quiet")
         .arg("--lazy")
+        .arg("--")
         .arg(mountpoint)
         .status()
         .map_err(|e| IoError(e))?
