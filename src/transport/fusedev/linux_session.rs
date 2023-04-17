@@ -379,7 +379,9 @@ fn fuse_kern_mount(
             file.as_raw_fd(),
         );
     }
-    if !auto_unmount {
+    if auto_unmount {
+        fuse_fusermount_mount(mountpoint, fsname, subtype, &opts, flags, auto_unmount)
+    } else {
         match mount(
             Some(fsname),
             mountpoint,
@@ -387,16 +389,15 @@ fn fuse_kern_mount(
             flags,
             Some(opts.deref()),
         ) {
-            Ok(()) => return Ok((file, None)),
-            Err(nix::errno::Errno::EPERM) => (),
-            Err(e) => {
-                return Err(SessionFailure(format!(
-                    "failed to mount {mountpoint:?}: {e}"
-                )))
+            Ok(()) => Ok((file, None)),
+            Err(nix::errno::Errno::EPERM) => {
+                fuse_fusermount_mount(mountpoint, fsname, subtype, &opts, flags, auto_unmount)
             }
+            Err(e) => Err(SessionFailure(format!(
+                "failed to mount {mountpoint:?}: {e}"
+            ))),
         }
     }
-    fuse_fusermount_mount(mountpoint, fsname, subtype, &opts, flags, auto_unmount)
 }
 
 fn msflags_to_string(flags: MsFlags) -> String {
