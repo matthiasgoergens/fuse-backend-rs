@@ -130,7 +130,8 @@ impl FuseSession {
 
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
-        // If we have a keep_alive sockt, just drop it, and let fusermount3 do the unmount.
+        // If we have a keep_alive socket, just drop it,
+        // and let fusermount3 do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
             if let Some(mountpoint) = self.mountpoint.to_str() {
                 fuse_kern_umount(mountpoint, file)
@@ -204,7 +205,6 @@ impl FuseSession {
 
 impl Drop for FuseSession {
     fn drop(&mut self) {
-        drop(self.keep_alive.take());
         let _ = self.umount();
     }
 }
@@ -479,7 +479,7 @@ fn fuse_fusermount_mount(
         .map_err(IoError)?;
     if auto_unmount {
         std::thread::spawn(move || {
-            proc.wait().ok();
+            let _ = proc.wait();
         });
     } else {
         match proc.wait().map_err(IoError)?.code() {
