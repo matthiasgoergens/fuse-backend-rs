@@ -380,7 +380,7 @@ fn fuse_kern_mount(
         );
     }
     if auto_unmount {
-        fuse_fusermount_mount(mountpoint, fsname, subtype, &opts, flags, auto_unmount)
+        fuse_fusermount_mount(mountpoint, fsname, subtype, opts, flags, auto_unmount)
     } else {
         match mount(
             Some(fsname),
@@ -391,7 +391,7 @@ fn fuse_kern_mount(
         ) {
             Ok(()) => Ok((file, None)),
             Err(nix::errno::Errno::EPERM) => {
-                fuse_fusermount_mount(mountpoint, fsname, subtype, &opts, flags, auto_unmount)
+                fuse_fusermount_mount(mountpoint, fsname, subtype, opts, flags, auto_unmount)
             }
             Err(e) => Err(SessionFailure(format!(
                 "failed to mount {mountpoint:?}: {e}"
@@ -425,18 +425,18 @@ fn msflags_to_string(flags: MsFlags) -> String {
     .join(",")
 }
 
-/// Mount a fuse file system
+/// Mount a fuse file system with fusermount
 fn fuse_fusermount_mount(
     mountpoint: &Path,
     fsname: &str,
     subtype: &str,
-    opts: &str,
+    opts: String,
     flags: MsFlags,
     auto_unmount: bool,
 ) -> Result<(File, Option<UnixStream>)> {
     let mut opts = vec![
         format!("fsname={fsname}"),
-        opts.to_owned(),
+        opts,
         msflags_to_string(flags),
     ];
     if !subtype.is_empty() {
